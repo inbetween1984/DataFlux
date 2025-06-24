@@ -4,7 +4,7 @@ import logging
 from datetime import datetime, UTC
 import aio_pika
 from dotenv import load_dotenv
-from influxdb_client_3 import InfluxDBClient3
+from questdb.ingress import Sender, TimestampNanos
 from tenacity import retry, stop_after_attempt, wait_exponential
 import os
 
@@ -12,48 +12,49 @@ load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s: %(message)s'
 )
 logger = logging.getLogger('stream_processor')
 
-INFLUXDB_HOST = os.getenv('INFLUXDB_HOST')
-INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN')
-INFLUXDB_DATABASE = os.getenv('INFLUXDB_DATABASE')
+QUESTDB_HOST = os.getenv('QUESTDB_HOST')
+QUESTDB_PORT = os.getenv('QUESTDB_PORT')
+QUESTDB_TABLE = os.getenv('QUESTDB_TABLE')
 RABBITMQ_URL = os.getenv('RABBITMQ_URL')
 RABBITMQ_QUEUE = os.getenv('RABBITMQ_QUEUE')
 
-
 class StreamProcessor:
     def __init__(self):
-        self.influx_client = InfluxDBClient3(
-            host=INFLUXDB_HOST,
-            token=INFLUXDB_TOKEN,
-            database=INFLUXDB_DATABASE
-        )
         self.rabbit_connection = aio_pika.Connection
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10)) #повтор, если influx недоступен
-    async def write_to_influx(self, entity_id: str, action: str, timestamp: datetime) -> None:
-        timestamp_ns = int(timestamp.timestamp() * 1_000_000_000)
-        record = (
-            f"{INFLUXDB_DATABASE},entity_id={entity_id},action={action} value=1 {timestamp_ns}"
-        )
+    def get_sender(self):
+        conf = f'http::addr={QUESTDB_HOST}:{QUESTDB_PORT};'
+        return Sender.from_conf(conf)
 
-        await asyncio.to_thread(self.influx_client.write, record)
-        logger.info(f"success wrote data to {INFLUXDB_DATABASE}: entity_id={entity_id}, action={action}, timestamp={timestamp}")
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10))
+    async def write_to_questdb(self, entity_id: str, action: str, timestamp: datetime) -> None:
+        with self.get_sender() as sender:
+            timestamp_ns = TimestampNanos(int(timestamp.timestamp() * 1_000_000_000))
+            sender.row(
+                QUESTDB_TABLE,
+                symbols={'entity_id': entity_id, 'action': action},
+                columns={'value': 1.0},
+                at=timestamp_ns
+            )
+            sender.flush()
+            logger.info(f"success wrote data to {QUESTDB_TABLE}: entity_id={entity_id}, action={action}, timestamp={timestamp}")
 
     async def process_message(self, message: aio_pika.IncomingMessage) -> None:
         logger.debug(f"received message: {message}")
         async with message.process():
             try:
                 data = json.loads(message.body.decode())
-
                 entity_id = data['entity_id']
                 action = data['action']
                 timestamp_str = datetime.now(UTC).isoformat()
                 timestamp = datetime.fromisoformat(timestamp_str)
 
-                await self.write_to_influx(entity_id, action, timestamp)
+                await self.write_to_questdb(entity_id, action, timestamp)
 
             except Exception as e:
                 logger.error(f"failed to process message: {e}")
@@ -81,8 +82,7 @@ class StreamProcessor:
         logger.info("shutting down stream processor...")
         if self.rabbit_connection:
             await self.rabbit_connection.close()
-        self.influx_client.close()
-
+        logger.info("stream processor shut down")
 
 async def main():
     processor = StreamProcessor()
@@ -91,7 +91,6 @@ async def main():
     except KeyboardInterrupt:
         logger.info("received shutdown signal")
         await processor.shutdown()
-
 
 if __name__ == "__main__":
     asyncio.run(main())
